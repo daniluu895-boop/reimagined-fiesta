@@ -1,26 +1,28 @@
+# main.py
 import asyncio
+import os
 from aiogram import Dispatcher, Bot
+from aiogram.client.session.aiohttp import AiohttpSession
 from config import BOT_TOKEN
 from utils.logger import logger
 from database.database import init_db
 from bot.handlers import router
 
+PROXY_URL = os.getenv("PROXY_URL")
+
 async def main():
     logger.info("Starting bot...")
     
-    # Создаем папку логов, если нет
-    import os
     if not os.path.exists("logs"):
         os.makedirs("logs")
 
-    # Инициализация БД
     await init_db()
     logger.info("Database initialized")
     
-    # Добавим тестовую категорию, если их нет
     from database.database import async_session_maker
     from database.models import Category
     from sqlalchemy import select
+    
     async with async_session_maker() as session:
         if not await session.scalar(select(Category).limit(1)):
             session.add(Category(name="Футболки"))
@@ -28,16 +30,24 @@ async def main():
             await session.commit()
             logger.info("Default categories added")
 
-    bot = Bot(token=BOT_TOKEN)
+    # 🔹 Простая инициализация сессии
+    if PROXY_URL:
+        session = AiohttpSession(proxy=PROXY_URL)
+        logger.info(f"Bot started with proxy: {PROXY_URL}")
+    else:
+        session = AiohttpSession()
+        logger.warning("Bot started without proxy")
+    
+    bot = Bot(token=BOT_TOKEN, session=session)
     dp = Dispatcher()
-
     dp.include_router(router)
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
+    await bot.session.close()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot stopped.")
+        logger.info("Bot stopped by user")
