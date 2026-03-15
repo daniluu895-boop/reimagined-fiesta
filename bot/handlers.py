@@ -1,4 +1,5 @@
 from aiogram import Router, F, types
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from sqlalchemy import select
@@ -49,7 +50,7 @@ async def show_products(callback: types.CallbackQuery):
     cat_id = int(callback.data.split("_")[1])
     async with async_session_maker() as session:
         prods = await session.scalars(select(Product).where(Product.category_id == cat_id))
-        builder = types.InlineKeyboardBuilder()
+        builder = InlineKeyboardBuilder()
         for p in prods:
             builder.button(text=p.name, callback_data=f"prod_{p.id}")
         builder.button(text="🔙 Назад", callback_data="back_to_cats")
@@ -84,12 +85,26 @@ async def select_variant(callback: types.CallbackQuery):
     prod_id = int(callback.data.split("_")[2])
     async with async_session_maker() as session:
         variants = await session.scalars(select(ProductVariant).where(ProductVariant.product_id == prod_id))
-        if not variants.all():
+        variants_list = variants.all()
+        
+        if not variants_list:
             await callback.answer("Нет доступных вариантов")
             return
-        # Перезапрос т.к. all() "съедает" результат
-        variants = await session.scalars(select(ProductVariant).where(ProductVariant.product_id == prod_id))
-        await callback.message.edit_text("Выберите вариант:", reply_markup=variants_kb(variants.all(), prod_id))
+
+        kb = variants_kb(variants_list, prod_id)
+        
+        # Проверяем, есть ли у сообщения фото
+        if callback.message.photo:
+            # Если фото есть, редактируем подпись (caption)
+            await callback.message.edit_caption(caption="Выберите вариант:", reply_markup=kb)
+        elif callback.message.text:
+            # Если только текст, редактируем текст
+            await callback.message.edit_text("Выберите вариант:", reply_markup=kb)
+        else:
+            # Если совсем ничего (на всякий случай), отправляем новое
+            await callback.message.answer("Выберите вариант:", reply_markup=kb)
+            
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("var_"))
 async def add_to_cart(callback: types.CallbackQuery):
@@ -151,7 +166,7 @@ async def admin_add_desc(message: types.Message, state: FSMContext):
     # Выведем список категорий для выбора
     async with async_session_maker() as session:
         cats = await session.scalars(select(Category))
-        builder = types.InlineKeyboardBuilder()
+        builder = InlineKeyboardBuilder()
         for c in cats:
             builder.button(text=c.name, callback_data=f"setcat_{c.id}")
     await message.answer("Выберите категорию:", reply_markup=builder.as_markup())
