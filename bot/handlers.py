@@ -3,10 +3,16 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 from database.database import async_session_maker
-from database.models import User, Category, Product, ProductVariant, CartItem
+from database.models import User, Category, Product, ProductVariant, CartItem, Order, OrderItem
 from config import ADMIN_ID
 from utils.logger import logger
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.exceptions import TelegramBadRequest
+from datetime import datetime
+import time
+
 
 # Импортируем клавиатуры и состояния из соседних файлов
 from bot.keyboards.keyboards import (
@@ -22,16 +28,30 @@ router = Router()
 async def cmd_start(message: types.Message):
     async with async_session_maker() as session:
         user = await session.scalar(select(User).where(User.telegram_id == message.from_user.id))
+        
         if not user:
+            # Если пользователя нет - создаем
             new_user = User(
                 telegram_id=message.from_user.id,
                 username=message.from_user.username,
                 first_name=message.from_user.first_name,
-                is_admin=(message.from_user.id == ADMIN_ID)
+                last_name=message.from_user.last_name,
+                language_code=message.from_user.language_code, # Сохраняем язык
+                is_admin=(message.from_user.id == ADMIN_ID),
+                interaction_count=1 # Первое посещение
             )
             session.add(new_user)
             await session.commit()
             logger.info(f"New user: {message.from_user.id}")
+        else:
+            # Если пользователь есть - обновляем данные и увеличиваем счетчик
+            user.username = message.from_user.username
+            user.first_name = message.from_user.first_name
+            user.last_name = message.from_user.last_name
+            user.language_code = message.from_user.language_code
+            user.interaction_count += 1 # Увеличиваем счетчик заходов
+            user.last_seen = datetime.utcnow() # Обновляем время последнего визита
+            await session.commit()
 
     if message.from_user.id == ADMIN_ID:
         await message.answer("👋 Здравствуй, Админ!", reply_markup=admin_menu_kb())
@@ -55,7 +75,12 @@ async def show_products(callback: types.CallbackQuery):
             builder.button(text=p.name, callback_data=f"prod_{p.id}")
         builder.button(text="🔙 Назад", callback_data="back_to_cats")
         builder.adjust(1)
-        await callback.message.edit_text("Товары:", reply_markup=builder.as_markup())
+        
+        # Оборачиваем в try, чтобы не было ошибки "message is not modified"
+        try:
+            await callback.message.edit_text("Товары:", reply_markup=builder.as_markup())
+        except TelegramBadRequest:
+            pass # Если сообщение такое же - просто игнорируем
 
 @router.callback_query(F.data == "back_to_cats")
 async def back_to_cats(callback: types.CallbackQuery):
@@ -125,23 +150,32 @@ async def add_to_cart(callback: types.CallbackQuery):
 async def view_cart(message: types.Message):
     async with async_session_maker() as session:
         user = await session.scalar(select(User).where(User.telegram_id == message.from_user.id))
-        items = await session.scalars(select(CartItem).where(CartItem.user_id == user.id))
+        
+        # --- ИСПРАВЛЕННЫЙ ЗАПРОС ---
+        # Мы говорим: выбери CartItem, И ПОДГРУЗИ (options) связанные variant и product
+        items = await session.scalars(
+            select(CartItem)
+            .where(CartItem.user_id == user.id)
+            .options(
+                selectinload(CartItem.variant).selectinload(ProductVariant.product)
+            )
+        )
+        # ---------------------------
+        
         items_list = items.all()
         
         if not items_list:
             await message.answer("Корзина пуста")
             return
 
-        # Подгружаем данные для отображения
+        # Подгружать данные здесь больше не нужно, они уже загружены!
         text = "<b>Корзина:</b>\n"
         total = 0
         for item in items_list:
-            # Явно подгружаем связанные объекты (в реальном проекте лучше selectinload)
-            var = await session.get(ProductVariant, item.variant_id)
-            prod = await session.get(Product, var.product_id)
-            subtotal = var.price * item.quantity
+            # Теперь доступ к item.variant.product не вызывает ошибку
+            subtotal = item.variant.price * item.quantity
             total += subtotal
-            text += f"- {prod.name} ({var.size}) x{item.quantity} = {subtotal}₽\n"
+            text += f"- {item.variant.product.name} ({item.variant.size}) x{item.quantity} = {subtotal}₽\n"
         
         text += f"\n<b>Итого: {total}₽</b>"
         await message.answer(text, parse_mode="HTML", reply_markup=cart_kb(items_list))
@@ -240,3 +274,187 @@ async def admin_save(callback: types.CallbackQuery, state: FSMContext):
 async def admin_cancel(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("Действие отменено.")
+
+# --- 5. ОФОРМЛЕНИЕ ЗАКАЗА (CHECKOUT) ---
+
+# Шаг 1: Нажатие кнопки "Оформить заказ"
+@router.callback_query(F.data == "checkout")
+async def start_checkout(callback: types.CallbackQuery, state: FSMContext):
+    async with async_session_maker() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
+        items = await session.scalars(select(CartItem).where(CartItem.user_id == user.id))
+        
+        # Проверка: корзина пуста?
+        if not items.all():
+            await callback.answer("Корзина пуста!")
+            return
+
+    await state.set_state(OrderState.phone)
+    # Клавиатура для отправки контакта
+    kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="📲 Отправить номер", request_contact=True)],
+        [KeyboardButton(text="❌ Отмена")]
+    ], resize_keyboard=True)
+    await callback.message.answer("Введите номер телефона или нажмите кнопку:", reply_markup=kb)
+    await callback.answer()
+
+# Шаг 2: Получение телефона
+@router.message(OrderState.phone, F.contact | F.text)
+async def process_phone(message: types.Message, state: FSMContext):
+    phone = ""
+    if message.contact:
+        phone = message.contact.phone_number
+    else:
+        phone = message.text
+    
+    # Простая валидация (должны быть цифры)
+    if not any(char.isdigit() for char in phone):
+        await message.answer("Пожалуйста, введите корректный номер телефона.")
+        return
+
+    await state.update_data(phone=phone)
+    await state.set_state(OrderState.address)
+    await message.answer("Отлично! Теперь введите адрес доставки:", reply_markup=ReplyKeyboardRemove())
+
+# Шаг 3: Получение адреса
+@router.message(OrderState.address)
+async def process_address(message: types.Message, state: FSMContext):
+    await state.update_data(address=message.text)
+    await state.set_state(OrderState.confirm)
+    
+    # Собираем данные для финального сообщения
+    data = await state.get_data()
+    user_id = message.from_user.id
+    
+    # Считаем итог
+    total = 0
+    text_list = []
+    async with async_session_maker() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == user_id))
+        items = await session.scalars(select(CartItem).where(CartItem.user_id == user.id))
+        
+        for item in items.all():
+            var = await session.get(ProductVariant, item.variant_id)
+            prod = await session.get(Product, var.product_id)
+            subtotal = var.price * item.quantity
+            total += subtotal
+            text_list.append(f"• {prod.name} ({var.size}) x{item.quantity} = {subtotal}₽")
+
+    text = (
+        f"<b>Подтвердите заказ:</b>\n\n"
+        f"📞 Телефон: {data['phone']}\n"
+        f"🏠 Адрес: {data['address']}\n\n"
+        f"Товары:\n" + "\n".join(text_list) + 
+        f"\n\n💰 <b>Итого: {total}₽</b>"
+    )
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подтвердить", callback_data="confirm_order_final")
+    builder.button(text="❌ Отмена", callback_data="cancel_order_final")
+    builder.adjust(2)
+    
+    await message.answer(text, parse_mode="HTML", reply_markup=builder.as_markup())
+
+@router.callback_query(F.data == "confirm_order_final")
+async def finish_order(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.clear()
+    
+    async with async_session_maker() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
+        items = await session.scalars(select(CartItem).where(CartItem.user_id == user.id))
+        items_list = items.all()
+        
+        if not items_list:
+            await callback.message.edit_text("Корзина пуста.")
+            return
+
+        # 1. Считаем общую сумму и готовим список для чека
+        total_amount = 0
+        receipt_lines = []
+        for item in items_list:
+            var = await session.get(ProductVariant, item.variant_id)
+            prod = await session.get(Product, var.product_id)
+            subtotal = var.price * item.quantity
+            total_amount += subtotal
+            receipt_lines.append(f"• {prod.name} ({var.size}) x{item.quantity} = {subtotal}₽")
+
+        # 2. Создаем заказ с ВРЕМЕННЫМ номером (чтобы обойти ошибку NOT NULL)
+        import time
+        temp_number = f"TEMP-{int(time.time())}" 
+        
+        order = Order(
+            order_number=temp_number, # Передаем временный номер
+            user_id=user.id,
+            total_amount=total_amount,
+            status="new",
+            customer_phone=data['phone'],
+            shipping_address=data['address'],
+            customer_name=user.first_name
+        )
+        session.add(order)
+        await session.flush() # Теперь у заказа есть реальный ID
+        
+        # 3. Генерируем правильный номер заказа на основе ID
+        year = datetime.now().year
+        real_order_number = f"ORD-{year}-{order.id}"
+        order.order_number = real_order_number # Обновляем номер в объекте
+
+        # 4. Переносим товары в order_items
+        for item in items_list:
+            var = await session.get(ProductVariant, item.variant_id)
+            prod = await session.get(Product, var.product_id)
+            
+            order_item = OrderItem(
+                order_id=order.id,
+                variant_id=var.id,
+                product_name=prod.name,
+                size=var.size,
+                color=var.color,
+                quantity=item.quantity,
+                price_at_purchase=var.price,
+                subtotal=var.price * item.quantity
+            )
+            session.add(order_item)
+            
+            # Удаляем из корзины
+            await session.delete(item)
+
+        # 5. Обновляем статистику юзера
+        user.orders_count += 1
+        user.total_spent += total_amount
+
+        await session.commit()
+
+    # 6. Отправка чека пользователю
+    # Используем real_order_number, который мы сгенерировали
+    receipt_text = (
+        f"🎉 <b>Заказ успешно оформлен!</b>\n\n"
+        f"📝 <b>Номер заказа:</b> <code>{real_order_number}</code>\n"
+        f"📞 <b>Телефон:</b> {data['phone']}\n"
+        f"📍 <b>Адрес:</b> {data['address']}\n\n"
+        f"<b>Ваш чек:</b>\n" + "\n".join(receipt_lines) + 
+        f"\n\n💰 <b>Итого к оплате:</b> {total_amount}₽\n\n"
+        f"Ожидайте звонка менеджера!"
+    )
+    
+    # Убираем кнопки подтверждения и пишем чек
+    try:
+        await callback.message.edit_text(receipt_text, parse_mode="HTML")
+    except:
+        # Если не получается редактировать (например, сообщение слишком старое), шлем новое
+        await callback.message.answer(receipt_text, parse_mode="HTML")
+
+    # 7. Уведомление админа
+    admin_text = (
+        f"🛍 <b>Новый заказ!</b>\n"
+        f"Номер: {real_order_number}\n"
+        f"Клиент: {user.first_name} (@{user.username})\n"
+        f"Сумма: {total_amount}₽"
+    )
+    try:
+        await callback.bot.send_message(ADMIN_ID, admin_text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Не удалось уведомить админа: {e}")
+
+    await callback.answer()

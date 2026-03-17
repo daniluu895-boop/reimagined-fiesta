@@ -13,6 +13,13 @@ class User(Base):
     first_name: Mapped[str] = mapped_column(String(255), nullable=True)
     last_name: Mapped[str] = mapped_column(String(255), nullable=True)
     phone: Mapped[str] = mapped_column(String(20), nullable=True)
+    
+    # Новые поля для аналитики
+    language_code: Mapped[str] = mapped_column(String(10), nullable=True) # Язык пользователя
+    interaction_count: Mapped[int] = mapped_column(Integer, default=0)    # Счетчик заходов
+    total_spent: Mapped[int] = mapped_column(Integer, default=0)          # Всего потрачено денег
+    orders_count: Mapped[int] = mapped_column(Integer, default=0)         # Количество заказов
+    
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -72,6 +79,7 @@ class Order(Base):
     status: Mapped[str] = mapped_column(String(50), default='new')
     shipping_address: Mapped[str] = mapped_column(Text, nullable=True)
     customer_phone: Mapped[str] = mapped_column(String(20), nullable=True)
+    customer_name: Mapped[str] = mapped_column(String(255), nullable=True) # <--- ДОБАВИЛИ ЭТУ СТРОКУ
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     
     user = relationship("User", back_populates="orders")
@@ -83,8 +91,11 @@ class OrderItem(Base):
     order_id: Mapped[int] = mapped_column(Integer, ForeignKey("orders.id"), nullable=False)
     variant_id: Mapped[int] = mapped_column(Integer, ForeignKey("product_variants.id"), nullable=False)
     product_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    size: Mapped[str] = mapped_column(String(50), nullable=True)      # Добавили размер
+    color: Mapped[str] = mapped_column(String(50), nullable=True)     # Добавили цвет
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     price_at_purchase: Mapped[int] = mapped_column(Integer, nullable=False)
+    subtotal: Mapped[int] = mapped_column(Integer, nullable=False)    # Добавили сумму
     
     order = relationship("Order", back_populates="items")
 
