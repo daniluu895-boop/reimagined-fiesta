@@ -31,6 +31,10 @@ class User(Base):
     
     shipping_address: Mapped[str] = mapped_column(String(255), nullable=True) # Добавь это поле
 
+     # Поля для реферальной системы
+    referrer_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=True) # Кто пригласил
+    referral_count: Mapped[int] = mapped_column(Integer, default=0) # Сколько приглашено
+
 class Category(Base):
     __tablename__ = "categories"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

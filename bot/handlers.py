@@ -1,12 +1,12 @@
 from aiogram import Router, F, types
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from database.database import async_session_maker
 from database.models import User, Category, Product, ProductVariant, CartItem, Order, OrderItem
-from config import ADMIN_ID
+from config import ADMIN_ID, BOT_NAME
 from utils.logger import logger
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
@@ -25,32 +25,62 @@ router = Router()
 
 # --- 1. СТАРТ И РОЛИ ---
 @router.message(CommandStart())
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, command: Command):
+    # Проверяем, есть ли аргумент в команде (referral link)
+    referrer_id = None
+    if command.args:
+        try:
+            referrer_id = int(command.args)
+            # Защита: нельзя пригласить самого себя
+            if referrer_id == message.from_user.id:
+                referrer_id = None
+        except ValueError:
+            pass
+
     async with async_session_maker() as session:
         user = await session.scalar(select(User).where(User.telegram_id == message.from_user.id))
         
         if not user:
-            # Если пользователя нет - создаем
+            # Создаем нового юзера
             new_user = User(
                 telegram_id=message.from_user.id,
                 username=message.from_user.username,
                 first_name=message.from_user.first_name,
                 last_name=message.from_user.last_name,
-                language_code=message.from_user.language_code, # Сохраняем язык
+                language_code=message.from_user.language_code,
                 is_admin=(message.from_user.id == ADMIN_ID),
-                interaction_count=1 # Первое посещение
+                referrer_id=referrer_id # Записываем, кто пригласил
             )
             session.add(new_user)
-            await session.commit()
+            await session.commit() # Коммитим, чтобы получить ID
+            
+            # Если пользователь пришел по ссылке, обновляем статистику пригласившего
+            if referrer_id:
+                referrer_user = await session.scalar(select(User).where(User.telegram_id == referrer_id))
+                if referrer_user:
+                    referrer_user.referral_count += 1
+                    
+                    # Проверка награды (каждые 3)
+                    if referrer_user.referral_count % 3 == 0:
+                        # Тут мы можем выдавать промокод или просто уведомить
+                        # Пока просто уведомим
+                        await message.bot.send_message(
+                            referrer_id, 
+                            f"🎉 Ура! Вы пригласили {referrer_user.referral_count} друзей! Вам доступна скидка 15%."
+                        )
+                    else:
+                        await message.bot.send_message(
+                            referrer_id,
+                            f"🤝 По вашей ссылке перешел друг! Прогресс: {referrer_user.referral_count}/3"
+                        )
+                
+                await session.commit()
             logger.info(f"New user: {message.from_user.id}")
         else:
-            # Если пользователь есть - обновляем данные и увеличиваем счетчик
+            # Обновляем данные старого юзера
             user.username = message.from_user.username
             user.first_name = message.from_user.first_name
-            user.last_name = message.from_user.last_name
-            user.language_code = message.from_user.language_code
-            user.interaction_count += 1 # Увеличиваем счетчик заходов
-            user.last_seen = datetime.utcnow() # Обновляем время последнего визита
+            user.interaction_count += 1
             await session.commit()
 
     if message.from_user.id == ADMIN_ID:
@@ -548,6 +578,7 @@ async def show_profile(message: types.Message):
         # Клавиатура профиля (инлайн)
         builder = InlineKeyboardBuilder()
         builder.button(text="📦 Мои заказы", callback_data="profile_orders")
+        builder.button(text="👥 Пригласить друзей", callback_data="profile_referral")
         builder.button(text="✏️ Изменить данные", callback_data="profile_edit_data")
         builder.adjust(1)
 
@@ -645,6 +676,7 @@ async def back_to_profile(callback: types.CallbackQuery):
         )
         builder = InlineKeyboardBuilder()
         builder.button(text="📦 Мои заказы", callback_data="profile_orders")
+        builder.button(text="👥 Пригласить друзей", callback_data="profile_referral")
         builder.button(text="✏️ Изменить данные", callback_data="profile_edit_data")
         builder.adjust(1)
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
@@ -718,3 +750,43 @@ async def save_profile_address(message: types.Message, state: FSMContext):
     
     await state.clear()
     await message.answer(f"✅ Адрес обновлен: {message.text}")
+
+@router.callback_query(F.data == "profile_referral")
+async def profile_referral(callback: types.CallbackQuery):
+    async with async_session_maker() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
+        
+        # Генерируем ссылку (с очисткой имени)
+        clean_bot_name = BOT_NAME.replace("@", "").replace("https://t.me/", "").strip()
+        ref_link = f"https://t.me/{clean_bot_name}?start={user.telegram_id}"
+        
+        # Считаем прогресс
+        current_count = user.referral_count
+        needed = 3 - (current_count % 3)
+        if needed == 3: needed = 0 
+        bonuses_earned = current_count // 3
+
+        text = (
+            f"👥 <b>Реферальная программа</b>\n\n"
+            f"Приглашай друзей по ссылке ниже.\n"
+            f"За каждые 3 друга — скидка 15%!\n\n"
+            
+            # Ссылка в тексте (на случай, если кнопка не сработает)
+            f"🔗 <b>Ваша ссылка:</b>\n"
+            f"<code>{ref_link}</code>\n\n"
+            
+            f"📊 <b>Статистика:</b>\n"
+            f"👤 Приглашено: <b>{current_count}</b>\n"
+            f"🎁 Бонусов получено: <b>{bonuses_earned}</b>\n"
+            f"🚀 Осталось до скидки: <b>{needed}</b> чел."
+        )
+        
+        builder = InlineKeyboardBuilder()
+        
+        # Кнопка, которая открывает бота по ссылке (это и есть переход по реф. ссылке)
+        builder.button(text="🔗 Пригласить друга (Открыть)", url=ref_link)
+        
+        builder.button(text="🔙 Назад", callback_data="back_to_profile")
+        builder.adjust(1)
+        
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup(), disable_web_page_preview=True)
