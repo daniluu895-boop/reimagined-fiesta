@@ -158,17 +158,22 @@ async def show_products(callback: types.CallbackQuery):
         builder.button(text="🔙 Назад", callback_data="back_to_cats")
         builder.adjust(1)
         
-        # Оборачиваем в try, чтобы не было ошибки "message is not modified"
         try:
             await callback.message.edit_text("Товары:", reply_markup=builder.as_markup())
         except TelegramBadRequest:
-            pass # Если сообщение такое же - просто игнорируем
+            pass
+    
+    await callback.answer()
 
 @router.callback_query(F.data == "back_to_cats")
 async def back_to_cats(callback: types.CallbackQuery):
     async with async_session_maker() as session:
-        cats = await session.scalars(select(Category))
-        await callback.message.edit_text("Категории:", reply_markup=categories_kb(cats.all()))
+        cats = await session.scalars(select(Category).where(Category.is_active == True))
+        try:
+            await callback.message.edit_text("Категории:", reply_markup=categories_kb(cats.all()))
+        except TelegramBadRequest:
+            pass
+        await callback.answer()
 
 @router.callback_query(F.data.startswith("prod_"))
 async def show_product(callback: types.CallbackQuery):
@@ -179,12 +184,25 @@ async def show_product(callback: types.CallbackQuery):
             await callback.answer("Товар не найден")
             return
             
-        text = f"<b>{product.name}</b>\n{product.description}"
+        text = f"<b>{product.name}</b>\n{product.description or 'Описание отсутствует'}"
         if product.main_photo_id:
-            await callback.message.answer_photo(photo=product.main_photo_id, caption=text, parse_mode="HTML", reply_markup=product_actions_kb(prod_id))
-            await callback.message.delete()
+            try:
+                await callback.message.answer_photo(
+                    photo=product.main_photo_id, 
+                    caption=text, 
+                    parse_mode="HTML", 
+                    reply_markup=product_actions_kb(prod_id)
+                )
+                await callback.message.delete()
+            except TelegramBadRequest:
+                await callback.message.edit_text(text, parse_mode="HTML", reply_markup=product_actions_kb(prod_id))
         else:
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=product_actions_kb(prod_id))
+            try:
+                await callback.message.edit_text(text, parse_mode="HTML", reply_markup=product_actions_kb(prod_id))
+            except TelegramBadRequest:
+                pass
+    
+    await callback.answer()
 
 # --- 3. КОРЗИНА ---
 @router.callback_query(F.data.startswith("add_cart_"))
@@ -195,21 +213,20 @@ async def select_variant(callback: types.CallbackQuery):
         variants_list = variants.all()
         
         if not variants_list:
-            await callback.answer("Нет доступных вариантов")
+            await callback.answer("Нет доступных вариантов", show_alert=True)
             return
 
         kb = variants_kb(variants_list, prod_id)
         
-        # Проверяем, есть ли у сообщения фото
-        if callback.message.photo:
-            # Если фото есть, редактируем подпись (caption)
-            await callback.message.edit_caption(caption="Выберите вариант:", reply_markup=kb)
-        elif callback.message.text:
-            # Если только текст, редактируем текст
-            await callback.message.edit_text("Выберите вариант:", reply_markup=kb)
-        else:
-            # Если совсем ничего (на всякий случай), отправляем новое
-            await callback.message.answer("Выберите вариант:", reply_markup=kb)
+        try:
+            if callback.message.photo:
+                await callback.message.edit_caption(caption="Выберите вариант:", reply_markup=kb)
+            elif callback.message.text:
+                await callback.message.edit_text("Выберите вариант:", reply_markup=kb)
+            else:
+                await callback.message.answer("Выберите вариант:", reply_markup=kb)
+        except TelegramBadRequest:
+            pass
             
     await callback.answer()
 
@@ -814,11 +831,10 @@ async def profile_orders(callback: types.CallbackQuery):
 async def order_detail(callback: types.CallbackQuery):
     order_id = int(callback.data.split("_")[2])
     async with async_session_maker() as session:
-        # Подгружаем заказ И товары в нем (selectinload)
         order = await session.scalar(
             select(Order)
             .where(Order.id == order_id)
-            .options(selectinload(Order.items)) # Важно! Не забудь импортировать selectinload
+            .options(selectinload(Order.items))
         )
         
         if not order:
@@ -826,23 +842,37 @@ async def order_detail(callback: types.CallbackQuery):
             return
 
         text = f"🧾 <b>Чек по заказу #{order.order_number}</b>\n\n"
-        total = 0
+        subtotal = 0
         for item in order.items:
-            # item - это OrderItem, у него уже есть все данные
-            subtotal = item.price_at_purchase * item.quantity
-            total += subtotal
-            text += f"• {item.product_name} ({item.size}) x{item.quantity} = {subtotal}₽\n"
+            item_total = item.price_at_purchase * item.quantity
+            subtotal += item_total
+            text += f"• {item.product_name} ({item.size}) x{item.quantity} = {item_total}₽\n"
+        
+        # Вычисляем скидку
+        discount = subtotal - order.total_amount
+        if discount < 0:
+            discount = 0
+        
+        text += f"\n💰 <b>Сумма товаров:</b> {subtotal}₽\n"
+        if discount > 0:
+            text += f"📉 <b>Скидка:</b> -{discount}₽\n"
+        text += f"💳 <b>Итого:</b> {order.total_amount}₽\n"
         
         text += (
-            f"\n💵 <b>Итого:</b> {total}₽\n"
-            f"📍 Адрес: {order.shipping_address}\n"
-            f"📞 Телефон: {order.customer_phone}\n"
+            f"\n📍 Адрес: {order.shipping_address or 'Не указан'}\n"
+            f"📞 Телефон: {order.customer_phone or 'Не указан'}\n"
             f"📅 Дата: {order.created_at.strftime('%d.%m.%Y %H:%M')}"
         )
         
         builder = InlineKeyboardBuilder()
         builder.button(text="🔙 Назад к списку", callback_data="profile_orders")
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
+        
+        try:
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
+        except TelegramBadRequest:
+            pass
+        
+        await callback.answer()
 
 # --- НАВИГАЦИЯ ---
 
