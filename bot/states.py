@@ -11,6 +11,7 @@ class AddProductState(StatesGroup):
 class OrderState(StatesGroup):
     phone = State()
     address = State()
+    promo = State()
     confirm = State()
 
 class ProfileState(StatesGroup):

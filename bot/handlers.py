@@ -5,13 +5,15 @@ from aiogram.fsm.context import FSMContext
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from database.database import async_session_maker
-from database.models import User, Category, Product, ProductVariant, CartItem, Order, OrderItem
+from database.models import User, Category, Product, ProductVariant, CartItem, Order, OrderItem, PromoCode
 from config import ADMIN_ID, BOT_NAME
 from utils.logger import logger
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 from datetime import datetime
 import time
+import random
+import string
 
 
 # Импортируем клавиатуры и состояния из соседних файлов
@@ -26,7 +28,7 @@ router = Router()
 # --- 1. СТАРТ И РОЛИ ---
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, command: Command):
-    # Проверяем, есть ли аргумент в команде (referral link)
+    # 1. Пытаемся получить ID того, кто пригласил (если есть)
     referrer_id = None
     if command.args:
         try:
@@ -41,7 +43,9 @@ async def cmd_start(message: types.Message, command: Command):
         user = await session.scalar(select(User).where(User.telegram_id == message.from_user.id))
         
         if not user:
-            # Создаем нового юзера
+            # --- СЦЕНАРИЙ: НОВЫЙ ПОЛЬЗОВАТЕЛЬ ---
+            
+            # 2. Создаем пользователя (и сразу сохраняем реферера, если он есть)
             new_user = User(
                 telegram_id=message.from_user.id,
                 username=message.from_user.username,
@@ -49,44 +53,92 @@ async def cmd_start(message: types.Message, command: Command):
                 last_name=message.from_user.last_name,
                 language_code=message.from_user.language_code,
                 is_admin=(message.from_user.id == ADMIN_ID),
-                referrer_id=referrer_id # Записываем, кто пригласил
+                interaction_count=1,
+                referrer_id=referrer_id # Запоминаем, кто пригласил
             )
             session.add(new_user)
-            await session.commit() # Коммитим, чтобы получить ID
+            await session.flush() # Получаем ID нового юзера
+
+            # 3. Генерируем Welcome-промокод (-200₽) для НОВОГО юзера
+            import random, string
+            promo_str = "WELCOME-" + ''.join(random.choices(string.digits, k=6))
+            welcome_promo = PromoCode(
+                code=promo_str,
+                discount_amount=200, 
+                discount_percent=0,  
+                description="🎁 Подарок за регистрацию (-200₽)",
+                owner_id=new_user.id
+            )
+            session.add(welcome_promo)
             
-            # Если пользователь пришел по ссылке, обновляем статистику пригласившего
+            # 4. Обрабатываем логику РЕФЕРАЛЬНОЙ СИСТЕМЫ (если он пришел по ссылке)
             if referrer_id:
                 referrer_user = await session.scalar(select(User).where(User.telegram_id == referrer_id))
                 if referrer_user:
                     referrer_user.referral_count += 1
                     
-                    # Проверка награды (каждые 3)
+                    # Проверка награды для приглашающего (каждые 3 друга)
                     if referrer_user.referral_count % 3 == 0:
-                        # Тут мы можем выдавать промокод или просто уведомить
-                        # Пока просто уведомим
-                        await message.bot.send_message(
-                            referrer_id, 
-                            f"🎉 Ура! Вы пригласили {referrer_user.referral_count} друзей! Вам доступна скидка 15%."
+                        # Генерируем промокод для ПРИГЛАСИВШЕГО
+                        ref_promo_str = "GIFT-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+                        new_ref_promo = PromoCode(
+                            code=ref_promo_str,
+                            discount_percent=15,
+                            discount_amount=0,
+                            owner_id=referrer_user.id
                         )
+                        session.add(new_ref_promo)
+                        
+                        # Уведомляем приглашающего
+                        try:
+                            await message.bot.send_message(
+                                referrer_id, 
+                                f"🎉 Ура! Вы пригласили 3 друзей!\n"
+                                f"🎁 Ваш промокод на скидку 15%: <b><code>{ref_promo_str}</code></b>",
+                                parse_mode="HTML"
+                            )
+                        except:
+                            pass # Если бот не может написать приглашающему (заблокирован), игнорируем
                     else:
-                        await message.bot.send_message(
-                            referrer_id,
-                            f"🤝 По вашей ссылке перешел друг! Прогресс: {referrer_user.referral_count}/3"
-                        )
-                
-                await session.commit()
+                        # Уведомление о прогрессе
+                        try:
+                            await message.bot.send_message(
+                                referrer_id,
+                                f"🤝 По вашей ссылке перешел друг! Прогресс: {referrer_user.referral_count}/3"
+                            )
+                        except:
+                            pass
+
+            await session.commit()
             logger.info(f"New user: {message.from_user.id}")
+
+            # 5. Отправляем приветствие НОВОМУ юзеру
+            welcome_text = (
+                "👋 Добро пожаловать в магазин!\n\n"
+                f"🎉 В честь знакомства дарим вам промокод: <code>{promo_str}</code>\n"
+                "Он дает скидку 200₽ на первый заказ!\n\n"
+                "Посмотреть ваши промокоды можно в Профиле (👤)."
+            )
+
+            if message.from_user.id == ADMIN_ID:
+                await message.answer("👋 Здравствуй, Админ!", reply_markup=admin_menu_kb())
+            else:
+                await message.answer(welcome_text, parse_mode="HTML", reply_markup=main_menu_kb())
+
         else:
-            # Обновляем данные старого юзера
+            # --- СЦЕНАРИЙ: СТАРЫЙ ПОЛЬЗОВАТЕЛЬ ---
             user.username = message.from_user.username
             user.first_name = message.from_user.first_name
+            user.last_name = message.from_user.last_name
+            user.language_code = message.from_user.language_code
             user.interaction_count += 1
+            user.last_seen = datetime.utcnow()
             await session.commit()
 
-    if message.from_user.id == ADMIN_ID:
-        await message.answer("👋 Здравствуй, Админ!", reply_markup=admin_menu_kb())
-    else:
-        await message.answer("👋 Добро пожаловать в магазин!", reply_markup=main_menu_kb())
+            if message.from_user.id == ADMIN_ID:
+                await message.answer("👋 Здравствуй, Админ!", reply_markup=admin_menu_kb())
+            else:
+                await message.answer("👋 С возвращением!", reply_markup=main_menu_kb())
 
 # --- 2. КАТАЛОГ ---
 @router.message(F.text == "📦 Каталог")
@@ -401,16 +453,84 @@ async def process_address(message: types.Message, state: FSMContext):
             await session.commit()
 
     await state.update_data(address=address)
-    
-    # Переходим к подтверждению (Шаг 4)
-    await show_confirmation(message, state)
 
-# Шаг 4: Показ чека и подтверждение
+    # --- НОВЫЙ ШАГ: Спрашиваем промокод ---
+    await state.set_state(OrderState.promo)
+    
+    builder = ReplyKeyboardBuilder()
+    builder.add(KeyboardButton(text="Пропустить"))
+    builder.adjust(1)
+    
+    await message.answer("🎁 У вас есть промокод? Введите его или нажмите 'Пропустить'.", reply_markup=builder.as_markup())
+
+# Шаг 4: Обработка промокода
+@router.message(OrderState.promo)
+async def process_promo(message: types.Message, state: FSMContext):
+    promo_code_input = message.text
+    
+    # 1. Если нажали "Пропустить"
+    if promo_code_input == "Пропустить":
+        # Очищаем данные о скидке, если они были, и идем дальше
+        await state.update_data(applied_promo_id=None, discount_val=0, discount_type=None)
+        await show_confirmation(message, state)
+        return # Важно выйти, чтобы код ниже не выполнялся
+
+    # 2. Если ввели код
+    async with async_session_maker() as session:
+        # Ищем промокод в базе (активный, не использованный)
+        promo_obj = await session.scalar(
+            select(PromoCode).where(
+                PromoCode.code == promo_code_input, 
+                PromoCode.is_used == False
+            )
+        )
+        
+        if promo_obj:
+            # Промокод найден
+            discount_val = 0
+            discount_type = ""
+            
+            # Проверяем тип скидки: Рубли или Проценты
+            if promo_obj.discount_amount > 0:
+                discount_val = promo_obj.discount_amount
+                discount_type = "rub"
+                await message.answer(f"✅ Промокод принят! Скидка: {discount_val}₽")
+            
+            elif promo_obj.discount_percent > 0:
+                discount_val = promo_obj.discount_percent
+                discount_type = "percent"
+                await message.answer(f"✅ Промокод принят! Скидка: {discount_val}%")
+            
+            else:
+                # На всякий случай, если в базе пусто и там, и там
+                await message.answer("❌ Ошибка промокода.")
+                return
+
+            # Сохраняем данные в память машины состояний
+            await state.update_data(
+                applied_promo_id=promo_obj.id, 
+                discount_val=discount_val, 
+                discount_type=discount_type
+            )
+            
+            # Переходим к подтверждению
+            await show_confirmation(message, state)
+
+        else:
+            # Промокод не найден или использован
+            await message.answer("❌ Промокод не найден или уже использован. Попробуйте еще раз или нажмите 'Пропустить'.")
+            # Не меняем состояние, ждем повторного ввода
+
+# Шаг 5: Показ чека и подтверждение
 async def show_confirmation(message: types.Message, state: FSMContext):
     data = await state.get_data()
     user_id = message.from_user.id
     
-    # Считаем итог
+    # 1. Получаем данные о скидке
+    discount_val = data.get('discount_val', 0)
+    discount_type = data.get('discount_type') # 'rub' или 'percent'
+    
+    # 2. Считаем итоговую сумму корзины
     total = 0
     text_list = []
     async with async_session_maker() as session:
@@ -424,24 +544,50 @@ async def show_confirmation(message: types.Message, state: FSMContext):
             total += subtotal
             text_list.append(f"• {prod.name} ({var.size}) x{item.quantity} = {subtotal}₽")
 
+    # 3. Вычисляем размер скидки
+    discount_amount = 0
+    if discount_type == 'percent':
+        # Скидка в процентах
+        discount_amount = int(total * (discount_val / 100))
+    elif discount_type == 'rub':
+        # Скидка в рублях
+        discount_amount = discount_val
+    
+    # Защита: скидка не может быть больше суммы заказа
+    if discount_amount > total:
+        discount_amount = total
+    
+    # Итого к оплате
+    final_total = total - discount_amount
+
+    # 4. Формируем текст чека
     text = (
         f"<b>Подтвердите заказ:</b>\n\n"
         f"📞 Телефон: {data['phone']}\n"
         f"🏠 Адрес: {data['address']}\n\n"
-        f"Товары:\n" + "\n".join(text_list) + 
-        f"\n\n💰 <b>Итого: {total}₽</b>"
+        f"<b>Ваши товары:</b>\n" + "\n".join(text_list) + 
+        f"\n\n💰 <b>Сумма товаров:</b> {total}₽"
     )
     
+    # Если есть скидка, добавляем строку
+    if discount_amount > 0:
+        text += f"\n📉 <b>Скидка:</b> -{discount_amount}₽"
+    
+    text += f"\n\n💳 <b>Итого к оплате:</b> {final_total}₽"
+
+    # 5. Клавиатура
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Подтвердить", callback_data="confirm_order_final")
     builder.button(text="❌ Отмена", callback_data="cancel_order_final")
     builder.adjust(2)
     
-    # Убираем Reply клавиатуру и присылаем чек
+    # Отправляем чек (убираем Reply клавиатуру "Пропустить")
     await message.answer(text, parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
+    # Отправляем кнопки подтверждения
     await message.answer("Все верно?", reply_markup=builder.as_markup())
 
-# Шаг 5: Финал (Сохранение в БД)
+
+# Шаг 6: Финал (Сохранение в БД)
 @router.callback_query(F.data == "confirm_order_final")
 async def finish_order(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -508,6 +654,12 @@ async def finish_order(callback: types.CallbackQuery, state: FSMContext):
         # 5. Статистика
         user.orders_count += 1
         user.total_spent += total_amount
+
+        # Если был использован промокод, удаляем его
+        if 'applied_promo_id' in data:
+            promo_to_deactivate = await session.get(PromoCode, data['applied_promo_id'])
+            if promo_to_deactivate:
+                promo_to_deactivate.is_used = True
 
         await session.commit()
 
@@ -578,6 +730,7 @@ async def show_profile(message: types.Message):
         # Клавиатура профиля (инлайн)
         builder = InlineKeyboardBuilder()
         builder.button(text="📦 Мои заказы", callback_data="profile_orders")
+        builder.button(text="🎁 Промокоды", callback_data="profile_promos")
         builder.button(text="👥 Пригласить друзей", callback_data="profile_referral")
         builder.button(text="✏️ Изменить данные", callback_data="profile_edit_data")
         builder.adjust(1)
@@ -676,6 +829,7 @@ async def back_to_profile(callback: types.CallbackQuery):
         )
         builder = InlineKeyboardBuilder()
         builder.button(text="📦 Мои заказы", callback_data="profile_orders")
+        builder.button(text="🎁 Промокоды", callback_data="profile_promos")
         builder.button(text="👥 Пригласить друзей", callback_data="profile_referral")
         builder.button(text="✏️ Изменить данные", callback_data="profile_edit_data")
         builder.adjust(1)
@@ -790,3 +944,34 @@ async def profile_referral(callback: types.CallbackQuery):
         builder.adjust(1)
         
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup(), disable_web_page_preview=True)
+
+@router.callback_query(F.data == "profile_promos")
+async def profile_promos(callback: types.CallbackQuery):
+    async with async_session_maker() as session:
+        # Ищем все активные (не использованные) промокоды пользователя
+        promos = await session.scalars(
+            select(PromoCode)
+            .where(PromoCode.owner_id == callback.from_user.id, PromoCode.is_used == False)
+        )
+        promos_list = promos.all()
+
+        if not promos_list:
+            text = "🎁 <b>Ваши промокоды</b>\n\nУ вас пока нет активных промокодов."
+        else:
+            text = "🎁 <b>Ваши промокоды</b>\n\n"
+            for p in promos_list:
+                # Формируем строку скидки
+                if p.discount_amount > 0:
+                    disc = f"{p.discount_amount}₽"
+                else:
+                    disc = f"{p.discount_percent}%"
+                
+                text += (
+                    f"🏷 <b>{p.description or 'Промокод'}</b>\n"
+                    f"Код: <code>{p.code}</code>\n"
+                    f"Скидка: {disc}\n\n"
+                )
+
+        builder = InlineKeyboardBuilder()
+        builder.button(text="🔙 Назад", callback_data="back_to_profile")
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())

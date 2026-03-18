@@ -111,3 +111,16 @@ class WishlistItem(Base):
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
     product_id: Mapped[int] = mapped_column(Integer, ForeignKey("products.id"), nullable=False)
     user = relationship("User", back_populates="wishlist")
+
+class PromoCode(Base):
+    __tablename__ = "promocodes"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
+    
+    # Тип скидки: может быть процент ИЛИ фиксированная сумма
+    discount_percent: Mapped[int] = mapped_column(Integer, default=0)
+    discount_amount: Mapped[int] = mapped_column(Integer, default=0) # Новое поле: скидка в рублях
+    
+    description: Mapped[str] = mapped_column(String(255), default="") # Новое поле: описание
+    is_used: Mapped[bool] = mapped_column(Boolean, default=False)
+    owner_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=True)
