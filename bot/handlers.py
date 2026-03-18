@@ -602,33 +602,57 @@ async def finish_order(callback: types.CallbackQuery, state: FSMContext):
             await callback.message.edit_text("Корзина пуста.")
             return
 
-        # 1. Считаем общую сумму
-        total_amount = 0
+        # 1. Считаем суммы и собираем список товаров
+        base_amount = 0
         receipt_lines = []
+        admin_items_list = [] # Отдельный список для админа
+        
         for item in items_list:
             var = await session.get(ProductVariant, item.variant_id)
             prod = await session.get(Product, var.product_id)
             subtotal = var.price * item.quantity
-            total_amount += subtotal
+            base_amount += subtotal
             receipt_lines.append(f"• {prod.name} ({var.size}) x{item.quantity} = {subtotal}₽")
+            admin_items_list.append(f"• {prod.name} ({var.size}) x{item.quantity}")
 
-        # 2. Создаем заказ с ВРЕМЕННЫМ номером
+        # 2. Высчитываем скидку
+        discount_val = data.get('discount_val', 0)
+        discount_type = data.get('discount_type')
+        promo_code_str = None
+        
+        discount_amount = 0
+        if discount_type == 'percent':
+            discount_amount = int(base_amount * (discount_val / 100))
+        elif discount_type == 'rub':
+            discount_amount = discount_val
+        
+        # Защита от отрицательной суммы
+        if discount_amount > base_amount: discount_amount = base_amount
+        
+        total_amount = base_amount - discount_amount
+        
+        # Если был применен промокод, найдем его строку для админа
+        if 'applied_promo_id' in data:
+            promo_obj = await session.get(PromoCode, data['applied_promo_id'])
+            if promo_obj:
+                promo_code_str = promo_obj.code
+
+        # 3. Создаем заказ
         import time
         temp_number = f"TEMP-{int(time.time())}" 
         
         order = Order(
             order_number=temp_number,
             user_id=user.id,
-            total_amount=total_amount,
+            total_amount=total_amount, # Сохраняем итоговую сумму
             status="new",
             customer_phone=data['phone'],
             shipping_address=data['address'],
             customer_name=user.first_name
         )
         session.add(order)
-        await session.flush() # Получаем ID
+        await session.flush()
         
-        # 3. Генерируем правильный номер
         year = datetime.now().year
         real_order_number = f"ORD-{year}-{order.id}"
         order.order_number = real_order_number
@@ -649,46 +673,57 @@ async def finish_order(callback: types.CallbackQuery, state: FSMContext):
                 subtotal=var.price * item.quantity
             )
             session.add(order_item)
-            await session.delete(item) # Удаляем из корзины
+            await session.delete(item)
 
-        # 5. Статистика
+        # 5. Статистика и списание промокода
         user.orders_count += 1
         user.total_spent += total_amount
-
-        # Если был использован промокод, удаляем его
+        
         if 'applied_promo_id' in data:
-            promo_to_deactivate = await session.get(PromoCode, data['applied_promo_id'])
-            if promo_to_deactivate:
-                promo_to_deactivate.is_used = True
+            promo = await session.get(PromoCode, data['applied_promo_id'])
+            if promo:
+                promo.is_used = True
 
         await session.commit()
 
-    # 6. Чек пользователю
+    # 6. Чек для клиента
     receipt_text = (
-        f"🎉 <b>Заказ успешно оформлен!</b>\n\n"
-        f"📝 <b>Номер заказа:</b> <code>{real_order_number}</code>\n"
-        f"📞 <b>Телефон:</b> {data['phone']}\n"
-        f"📍 <b>Адрес:</b> {data['address']}\n\n"
-        f"<b>Ваш чек:</b>\n" + "\n".join(receipt_lines) + 
-        f"\n\n💰 <b>Итого к оплате:</b> {total_amount}₽\n\n"
-        f"Ожидайте звонка менеджера!"
+        f"🎉 <b>Заказ оформлен!</b>\n"
+        f"📝 Номер: <code>{real_order_number}</code>\n"
+        f"📞 Телефон: {data['phone']}\n"
+        f"📍 Адрес: {data['address']}\n\n"
+        f"<b>Чек:</b>\n" + "\n".join(receipt_lines) +
+        f"\n💰 Сумма: {base_amount}₽"
     )
-    
+    if discount_amount > 0:
+        receipt_text += f"\n📉 Скидка: -{discount_amount}₽"
+    receipt_text += f"\n\n💳 <b>Итого:</b> {total_amount}₽"
+
     try:
-        # Пытаемся отредактировать сообщение "Все верно?"
-        await callback.message.delete() # Удаляем "Все верно?"
-        await callback.message.answer(receipt_text, parse_mode="HTML") # Шлем чек
-        # Или редактируем предыдущее, но там кнопки. Проще удалить и послать новое.
+        await callback.message.delete()
+        await callback.message.answer(receipt_text, parse_mode="HTML")
     except:
         await callback.message.answer(receipt_text, parse_mode="HTML")
-
-    # 7. Уведомление админа
+    
+    # 7. Уведомление для АДМИНА (Обновленное)
     admin_text = (
-        f"🛍 <b>Новый заказ!</b>\n"
-        f"Номер: {real_order_number}\n"
-        f"Клиент: {user.first_name} (@{user.username})\n"
-        f"Сумма: {total_amount}₽"
+        f"🛍 <b>НОВЫЙ ЗАКАЗ!</b>\n\n"
+        f"📝 <b>Номер:</b> <code>{real_order_number}</code>\n"
+        f"👤 <b>Клиент:</b> {user.first_name} (@{user.username})\n"
+        f"📞 <b>Телефон:</b> {data['phone']}\n"
+        f"📍 <b>Адрес:</b> {data['address']}\n"
+        f"📅 <b>Дата:</b> {order.created_at.strftime('%d.%m.%Y %H:%M')}\n\n"
+        
+        f"<b>Состав заказа:</b>\n" + "\n".join(admin_items_list) + "\n\n"
+        
+        f"💰 <b>Сумма товаров:</b> {base_amount}₽"
     )
+    
+    if promo_code_str:
+        admin_text += f"\n🏷 <b>Промокод:</b> <code>{promo_code_str}</code> (-{discount_amount}₽)"
+    
+    admin_text += f"\n\n💸 <b>ИТОГО к оплате:</b> <b>{total_amount}₽</b>"
+
     try:
         await callback.bot.send_message(ADMIN_ID, admin_text, parse_mode="HTML")
     except Exception as e:
@@ -948,10 +983,17 @@ async def profile_referral(callback: types.CallbackQuery):
 @router.callback_query(F.data == "profile_promos")
 async def profile_promos(callback: types.CallbackQuery):
     async with async_session_maker() as session:
-        # Ищем все активные (не использованные) промокоды пользователя
+        # 1. Сначала находим пользователя, чтобы получить его ВНУТРЕННИЙ ID (из базы)
+        user = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
+        
+        if not user:
+            await callback.answer("Ошибка данных.", show_alert=True)
+            return
+
+        # 2. Ищем промокоды, привязанные к этому ВНУТРЕННЕМУ ID
         promos = await session.scalars(
             select(PromoCode)
-            .where(PromoCode.owner_id == callback.from_user.id, PromoCode.is_used == False)
+            .where(PromoCode.owner_id == user.id, PromoCode.is_used == False)
         )
         promos_list = promos.all()
 
