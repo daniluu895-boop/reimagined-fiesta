@@ -6,7 +6,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from config import BOT_TOKEN
 from utils.logger import logger
 from database.database import init_db
-from bot.handlers import router
+from bot.handlers import router, admin_router, warehouse_router
 
 PROXY_URL = os.getenv("PROXY_URL")
 
@@ -41,6 +41,8 @@ async def main():
     bot = Bot(token=BOT_TOKEN, session=session)
     dp = Dispatcher()
     dp.include_router(router)
+    dp.include_router(admin_router)
+    dp.include_router(warehouse_router)
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
