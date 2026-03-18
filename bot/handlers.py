@@ -21,7 +21,7 @@ from bot.keyboards.keyboards import (
     admin_orders_kb, admin_order_detail_kb, admin_back_kb, ORDER_STATUSES,
     support_menu_kb, admin_support_kb, faq_kb, support_back_kb
 )
-from bot.states import AddProductState, OrderState, ProfileState, SupportState
+from bot.states import AddProductState, OrderState, ProfileState, SupportState, EditStockState
 
 router = Router()
 
@@ -139,20 +139,41 @@ async def show_catalog(message: types.Message):
 @router.callback_query(F.data.startswith("cat_"))
 async def show_products(callback: types.CallbackQuery):
     cat_id = int(callback.data.split("_")[1])
+    
     async with async_session_maker() as session:
-        prods = await session.scalars(select(Product).where(Product.category_id == cat_id, Product.is_active == True))
+        # Фильтруем: только товары с вариантами где есть остаток
+        products = await session.scalars(
+            select(Product)
+            .options(selectinload(Product.variants))
+            .where(Product.category_id == cat_id)
+        )
+        
+        # Фильтруем: оставляем только те, где есть хотя бы 1 вариант в наличии
+        available_products = [
+            p for p in products.all() 
+            if any(v.stock_quantity > 0 for v in p.variants)
+        ]
+        
+        if not available_products:
+            await callback.message.edit_text(
+                "В этой категории нет товаров в наличии",
+                reply_markup=back_to_cats_kb()
+            )
+            return
+        
         builder = InlineKeyboardBuilder()
-        for p in prods:
+        for p in available_products:
             builder.button(text=p.name, callback_data=f"prod_{p.id}")
         builder.button(text="🔙 Назад", callback_data="back_to_cats")
         builder.adjust(1)
         
         try:
-            await callback.message.edit_text("Товары:", reply_markup=builder.as_markup())
+            await callback.message.edit_text(
+                "Товары (в наличии):", 
+                reply_markup=builder.as_markup()
+            )
         except TelegramBadRequest:
             pass
-    
-    await callback.answer()
 
 
 @router.callback_query(F.data == "back_to_cats")
@@ -226,21 +247,36 @@ async def select_variant(callback: types.CallbackQuery):
 @router.callback_query(F.data.startswith("var_"))
 async def add_to_cart(callback: types.CallbackQuery):
     var_id = int(callback.data.split("_")[1])
+    
     async with async_session_maker() as session:
         user = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
         variant = await session.get(ProductVariant, var_id)
         
-        if not variant:
-            await callback.answer("Вариант не найден", show_alert=True)
+        # 🚫 Проверка остатков
+        if variant.stock_quantity <= 0:
+            await callback.answer("❌ Нет в наличии", show_alert=True)
             return
         
         existing = await session.scalar(
-            select(CartItem).where(CartItem.user_id == user.id, CartItem.variant_id == var_id)
+            select(CartItem).where(
+                CartItem.user_id == user.id, 
+                CartItem.variant_id == var_id
+            )
         )
+        
+        # Проверяем, чтобы не добавили больше чем есть
+        current_in_cart = existing.quantity if existing else 0
+        available = variant.stock_quantity - current_in_cart
+        
+        if available <= 0:
+            await callback.answer("❌ Больше нет в наличии", show_alert=True)
+            return
+        
         if existing:
             existing.quantity += 1
         else:
             session.add(CartItem(user_id=user.id, variant_id=var_id))
+        
         await session.commit()
     
     await callback.answer("✅ Добавлено в корзину!")
@@ -741,7 +777,24 @@ async def finish_order(callback: types.CallbackQuery, state: FSMContext):
         receipt_lines = []
         admin_items_list = []
         
+        # === СКЛАДСКОЙ УЧЁТ: Проверка остатков ===
         for item in items_list:
+            variant = await session.get(ProductVariant, item.variant_id)
+            
+            if variant.stock_quantity < item.quantity:
+                await callback.message.answer(
+                    f"❌ Недостаточно товара на складе: {item.variant.product.name} ({variant.size}/{variant.color})\n"
+                    f"Доступно: {variant.stock_quantity} шт."
+                )
+                return
+        
+        # === СКЛАДСКОЙ УЧЁТ: Списание ===
+        for item in items_list:
+            variant = await session.get(ProductVariant, item.variant_id)
+            
+            # Списываем остаток
+            variant.stock_quantity -= item.quantity
+            
             subtotal = item.variant.price * item.quantity
             base_amount += subtotal
             receipt_lines.append(f"• {item.variant.product.name} ({item.variant.size}) x{item.quantity} = {subtotal}₽")
@@ -808,6 +861,21 @@ async def finish_order(callback: types.CallbackQuery, state: FSMContext):
                 promo.is_used = True
 
         await session.commit()
+        
+        # === СКЛАДСКОЙ УЧЁТ: Уведомление о низком запасе ===
+        for item in items_list:
+            variant = await session.get(ProductVariant, item.variant_id)
+            if variant.stock_quantity <= 5:
+                try:
+                    await callback.bot.send_message(
+                        ADMIN_ID,
+                        f"⚠️ <b>Заканчивается товар!</b>\n\n"
+                        f"{item.variant.product.name} ({variant.size}/{variant.color})\n"
+                        f"Остаток: <b>{variant.stock_quantity}</b> шт.",
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
 
     receipt_text = (
         f"🎉 <b>Заказ оформлен!</b>\n"
@@ -1848,3 +1916,127 @@ async def admin_ban_user(callback: types.CallbackQuery):
 
 # Найдите функцию show_profile и добавьте кнопку в клавиатуру:
 # builder.button(text="🆘 Поддержка", callback_data="profile_support")
+
+
+# === СКЛАДСКОЙ УЧЁТ ===
+
+@router.message(F.text == "📊 Склад")
+async def admin_warehouse(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    async with async_session_maker() as session:
+        variants = await session.scalars(
+            select(ProductVariant)
+            .options(selectinload(ProductVariant.product))
+            .order_by(ProductVariant.stock_quantity.asc())  # Сначала мало
+        )
+        variants_list = variants.all()
+        
+        if not variants_list:
+            await message.answer("Нет товаров на складе")
+            return
+        
+        # Считаем статистику
+        total_items = sum(v.stock_quantity for v in variants_list)
+        low_stock = [v for v in variants_list if v.stock_quantity <= 5]
+        
+        text = (
+            f"📊 <b>Складская статистика</b>\n\n"
+            f"📦 Всего единиц: <b>{total_items}</b>\n"
+            f"👎 Мало на складе (≤5): <b>{len(low_stock)}</b>\n\n"
+            f"<b>Остатки по товарам:</b>\n"
+        )
+        
+        builder = InlineKeyboardBuilder()
+        
+        # Показываем первые 20 позиций
+        for v in variants_list[:20]:
+            emoji = "🔴" if v.stock_quantity == 0 else "🟡" if v.stock_quantity <= 5 else "🟢"
+            text += f"{emoji} {v.product.name} ({v.size}/{v.color}): <b>{v.stock_quantity}</b> шт.\n"
+            builder.button(
+                text=f"✏️ {v.product.name[:15]} ({v.size})", 
+                callback_data=f"edit_stock_{v.id}"
+            )
+        
+        if len(variants_list) > 20:
+            text += f"\n... и ещё {len(variants_list) - 20} позиций"
+        
+        builder.button(text="🔙 Назад", callback_data="admin_back_menu")
+        builder.adjust(2)
+        
+        await message.answer(text, parse_mode="HTML", reply_markup=builder.as_markup())
+
+# Редактирование остатков
+@router.callback_query(F.data.startswith("edit_stock_"))
+async def edit_stock_start(callback: types.CallbackQuery, state: FSMContext):
+    variant_id = int(callback.data.split("_")[2])
+    
+    async with async_session_maker() as session:
+        variant = await session.scalar(
+            select(ProductVariant)
+            .options(selectinload(ProductVariant.product))
+            .where(ProductVariant.id == variant_id)
+        )
+        
+        text = (
+            f"✏️ Редактирование остатков\n\n"
+            f"<b>Товар:</b> {variant.product.name}\n"
+            f"<b>Размер/Цвет:</b> {variant.size}/{variant.color}\n"
+            f"<b>Текущий остаток:</b> {variant.stock_quantity} шт.\n\n"
+            f"Введите новое количество:"
+        )
+        
+        await state.update_data(edit_stock_variant_id=variant_id)
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=admin_cancel_kb())
+    
+    await state.set_state(EditStockState.quantity)
+    await callback.answer()
+
+@router.message(EditStockState.quantity)
+async def edit_stock_save(message: types.Message, state: FSMContext):
+    try:
+        new_quantity = int(message.text)
+        if new_quantity < 0:
+            raise ValueError
+    except:
+        await message.answer("Введите число больше 0")
+        return
+    
+    data = await state.get_data()
+    variant_id = data["edit_stock_variant_id"]
+    
+    async with async_session_maker() as session:
+        variant = await session.get(ProductVariant, variant_id)
+        old_qty = variant.stock_quantity
+        variant.stock_quantity = new_quantity
+        await session.commit()
+        
+        await message.answer(
+            f"✅ Остаток обновлен!\n"
+            f"Было: {old_qty} → Стало: {new_quantity}"
+        )
+    
+    await state.clear()
+
+# Уведомление о низком запасе (вызывается при заказе)
+async def check_low_stock(variant_id: int, bot):
+    """Проверяет остаток и отправляет уведомление если мало"""
+    async with async_session_maker() as session:
+        variant = await session.scalar(
+            select(ProductVariant)
+            .options(selectinload(ProductVariant.product))
+            .where(ProductVariant.id == variant_id)
+        )
+        
+        if variant.stock_quantity <= 5:
+            try:
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ <b>Заканчивается товар!</b>\n\n"
+                    f"{variant.product.name} ({variant.size}/{variant.color})\n"
+                    f"Остаток: <b>{variant.stock_quantity}</b> шт.",
+                    parse_mode="HTML"
+                )
+            except:
+                pass

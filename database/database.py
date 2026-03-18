@@ -18,3 +18,7 @@ async def get_db():
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    
+
+    from database.seed import seed_database
+    await seed_database()

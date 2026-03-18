@@ -22,3 +22,6 @@ class SupportState(StatesGroup):
     user_message = State()
     admin_reply = State() 
     user_reply = State()
+
+class EditStockState(StatesGroup):
+    quantity = State()
