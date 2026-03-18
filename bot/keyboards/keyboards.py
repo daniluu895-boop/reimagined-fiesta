@@ -13,7 +13,8 @@ def admin_menu_kb():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Добавить товар"), KeyboardButton(text="📦 Каталог")],
         [KeyboardButton(text="📦 Заказы"), KeyboardButton(text="📊 Склад")],
-        [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🗑 Очистить БД")]
+        [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="👥 Пользователи")], 
+        [KeyboardButton(text="📢 Рассылка"), KeyboardButton(text="🗑 Очистить БД")]
     ], resize_keyboard=True)
 
 # --- Админ: Добавление товара ---

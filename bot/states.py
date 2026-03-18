@@ -25,3 +25,16 @@ class SupportState(StatesGroup):
 
 class EditStockState(StatesGroup):
     quantity = State()
+
+class BroadcastState(StatesGroup):
+    text = State()
+    confirm = State()
+
+class PromoState(StatesGroup):
+    type = State()
+    value = State()
+    description = State()  # Состояние для текста от админа
+    confirm = State()
+
+class AdminReplyState(StatesGroup):
+    text = State()
