@@ -28,6 +28,8 @@ class User(Base):
     carts = relationship("CartItem", back_populates="user")
     orders = relationship("Order", back_populates="user")
     wishlist = relationship("WishlistItem", back_populates="user")
+    
+    shipping_address: Mapped[str] = mapped_column(String(255), nullable=True) # Добавь это поле
 
 class Category(Base):
     __tablename__ = "categories"

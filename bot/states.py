@@ -12,3 +12,7 @@ class OrderState(StatesGroup):
     phone = State()
     address = State()
     confirm = State()
+
+class ProfileState(StatesGroup):
+    phone = State()
+    address = State()
