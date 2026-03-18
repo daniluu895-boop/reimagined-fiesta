@@ -17,3 +17,8 @@ class OrderState(StatesGroup):
 class ProfileState(StatesGroup):
     phone = State()
     address = State()
+
+class SupportState(StatesGroup):
+    user_message = State()
+    admin_reply = State() 
+    user_reply = State()

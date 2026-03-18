@@ -18,9 +18,10 @@ import string
 from bot.keyboards.keyboards import (
     main_menu_kb, admin_menu_kb, categories_kb, variants_kb,
     product_actions_kb, cart_kb, admin_cancel_kb, admin_confirm_kb,
-    admin_orders_kb, admin_order_detail_kb, admin_back_kb, ORDER_STATUSES
+    admin_orders_kb, admin_order_detail_kb, admin_back_kb, ORDER_STATUSES,
+    support_menu_kb, admin_support_kb, faq_kb, support_back_kb
 )
-from bot.states import AddProductState, OrderState, ProfileState
+from bot.states import AddProductState, OrderState, ProfileState, SupportState
 
 router = Router()
 
@@ -1485,3 +1486,365 @@ async def admin_back_menu(callback: types.CallbackQuery):
 async def admin_orders_info(callback: types.CallbackQuery):
     """Заглушка для кнопки с номером страницы"""
     await callback.answer()
+
+# ============================================================
+# ТЕХПОДДЕРЖКА
+# ============================================================
+
+# Константы FAQ
+FAQ_TEXTS = {
+    "delivery": (
+        "🚚 <b>Доставка</b>\n\n"
+        "📍 <b>Способы доставки:</b>\n"
+        "• Курьером до двери — от 300₽\n"
+        "• Самовывоз из пункта выдачи — от 150₽\n"
+        "• Почта России — от 200₽\n\n"
+        "⏰ <b>Сроки:</b>\n"
+        "• Москва и СПб — 1-2 дня\n"
+        "• Регионы — 3-7 дней\n\n"
+        "📦 Заказы отправляем в день оплаты (до 17:00)"
+    ),
+    "payment": (
+        "💳 <b>Оплата</b>\n\n"
+        "Доступные способы оплаты:\n\n"
+        "• 💳 Банковская карта (Visa, MasterCard, МИР)\n"
+        "• 📱 СБП (Система быстрых платежей)\n"
+        "• 💰 Наличными курьеру при получении\n\n"
+        "🔒 Все платежи защищены и безопасны."
+    ),
+    "return": (
+        "🔄 <b>Возврат и обмен</b>\n\n"
+        "✅ <b>Условия возврата:</b>\n"
+        "• 14 дней на возврат\n"
+        "• Товар должен быть в оригинальной упаковке\n"
+        "• Сохранены все бирки и ярлыки\n\n"
+        "📋 <b>Как оформить возврат:</b>\n"
+        "1. Напишите в поддержку\n"
+        "2. Укажите номер заказа\n"
+        "3. Опишите причину возврата\n\n"
+        "💰 Возврат средств в течение 5-7 дней"
+    ),
+    "sizes": (
+        "📏 <b>Размерная сетка</b>\n\n"
+        "<pre>"
+        "Размер  | Обхват груди | Обхват талии\n"
+        "─────────────────────────────────\n"
+        "   XS    |    84-88     |    64-68\n"
+        "   S     |    88-92     |    68-72\n"
+        "   M     |    92-96     |    76-80\n"
+        "   L     |    96-100    |    84-88\n"
+        "   XL    |   100-104    |    92-96\n"
+        "</pre>\n\n"
+        "💡 Если сомневаетесь с размером — напишите нам, поможем!"
+    ),
+    "contacts": (
+        "📞 <b>Контакты</b>\n\n"
+        "📱 Telegram: @your_support_bot\n"
+        "📧 Email: support@yoursite.com\n"
+        "⏰ Режим работы: Пн-Вс, 10:00-22:00\n\n"
+        "💬 Быстрее всего отвечаем здесь в боте!"
+    )
+}
+
+
+@router.message(F.text == "🆘 Поддержка")
+async def show_support_menu(message: types.Message):
+    """Вход в меню поддержки из главного меню"""
+    text = (
+        "🆘 <b>Служба поддержки</b>\n\n"
+        "Выберите действие или напишите нам:\n\n"
+        "⏰ Среднее время ответа: 15 минут"
+    )
+    
+    await message.answer(text, parse_mode="HTML", reply_markup=support_menu_kb())
+
+
+# Оставьте callback-версию для навигации внутри поддержки:
+@router.callback_query(F.data == "support_back")
+async def support_back(callback: types.CallbackQuery, state: FSMContext):
+    """Возврат в меню поддержки"""
+    await state.clear()
+    
+    text = (
+        "🆘 <b>Служба поддержки</b>\n\n"
+        "Выберите действие или напишите нам:\n\n"
+        "⏰ Среднее время ответа: 15 минут"
+    )
+    
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=support_menu_kb())
+    except TelegramBadRequest:
+        pass
+    
+    await callback.answer()
+
+
+# --- Новое обращение ---
+@router.callback_query(F.data == "support_new")
+async def support_new(callback: types.CallbackQuery, state: FSMContext):
+    """Начало нового обращения"""
+    await state.clear()
+    await state.set_state(SupportState.user_message)
+    
+    text = (
+        "✍️ <b>Напишите ваш вопрос</b>\n\n"
+        "Опишите проблему как можно подробнее.\n"
+        "Вы можете прикрепить фото или файл.\n\n"
+        "Для отмены нажмите кнопку ниже."
+    )
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Отмена", callback_data="support_cancel")
+    
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
+    except TelegramBadRequest:
+        pass
+    
+    await callback.answer()
+
+
+@router.message(SupportState.user_message)
+async def support_send_message(message: types.Message, state: FSMContext):
+    """Отправка сообщения в поддержку"""
+    # Проверка на бан
+    async with async_session_maker() as session:
+        user = await session.scalar(
+            select(User).where(User.telegram_id == message.from_user.id)
+        )
+        if user and user.is_banned:
+            await message.answer("⛔ Вы заблокированы и не можете писать в поддержку.")
+            await state.clear()
+            return
+    
+    # Формируем сообщение для админа
+    admin_text = (
+        f"📩 <b>Новое обращение в поддержку</b>\n\n"
+        f"👤 <b>От:</b> {message.from_user.full_name}\n"
+        f"🆔 <b>ID:</b> <code>{message.from_user.id}</code>\n"
+        f"📧 <b>Username:</b> @{message.from_user.username or 'не указан'}\n\n"
+        f"<b>Сообщение:</b>"
+    )
+    
+    # Отправляем админу с клавиатурой для ответа
+    try:
+        if message.photo:
+            # Если есть фото
+            admin_msg = await message.bot.send_photo(
+                ADMIN_ID,
+                photo=message.photo[-1].file_id,
+                caption=admin_text + f"\n\n{message.caption or ''}",
+                parse_mode="HTML",
+                reply_markup=admin_support_kb(message.from_user.id, message.message_id)
+            )
+        elif message.document:
+            # Если есть документ
+            admin_msg = await message.bot.send_document(
+                ADMIN_ID,
+                document=message.document.file_id,
+                caption=admin_text + f"\n\n{message.caption or ''}",
+                parse_mode="HTML",
+                reply_markup=admin_support_kb(message.from_user.id, message.message_id)
+            )
+        else:
+            # Текстовое сообщение
+            admin_msg = await message.bot.send_message(
+                ADMIN_ID,
+                admin_text + f"\n\n{message.text}",
+                parse_mode="HTML",
+                reply_markup=admin_support_kb(message.from_user.id, message.message_id)
+            )
+        
+        # Сохраняем ID сообщения админа для контекста
+        await state.update_data(
+            support_user_id=message.from_user.id,
+            last_admin_msg_id=admin_msg.message_id
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка отправки сообщения админу: {e}")
+        await message.answer("❌ Не удалось отправить сообщение. Попробуйте позже.")
+        await state.clear()
+        return
+    
+    await state.clear()
+    
+    # Подтверждение пользователю
+    await message.answer(
+        "✅ <b>Сообщение отправлено!</b>\n\n"
+        "Мы ответим в ближайшее время.\n"
+        "Обычно отвечаем в течение 15 минут.",
+        parse_mode="HTML"
+    )
+
+
+# --- Отмена ---
+@router.callback_query(F.data == "support_cancel")
+async def support_cancel(callback: types.CallbackQuery, state: FSMContext):
+    """Отмена написания сообщения"""
+    await state.clear()
+    
+    text = (
+        "🆘 <b>Служба поддержки</b>\n\n"
+        "Выберите действие или напишите нам:\n\n"
+        "⏰ Среднее время ответа: 15 минут"
+    )
+    
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=support_menu_kb())
+    except TelegramBadRequest:
+        pass
+    
+    await callback.answer("Отменено")
+
+
+# --- Назад в поддержку ---
+@router.callback_query(F.data == "support_back")
+async def support_back(callback: types.CallbackQuery, state: FSMContext):
+    """Возврат в меню поддержки"""
+    await state.clear()
+    
+    text = (
+        "🆘 <b>Служба поддержки</b>\n\n"
+        "Выберите действие или напишите нам:\n\n"
+        "⏰ Среднее время ответа: 15 минут"
+    )
+    
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=support_menu_kb())
+    except TelegramBadRequest:
+        pass
+    
+    await callback.answer()
+
+
+# --- FAQ ---
+@router.callback_query(F.data == "support_faq")
+async def support_faq(callback: types.CallbackQuery):
+    """Меню FAQ"""
+    text = "❓ <b>Частые вопросы</b>\n\nВыберите тему:"
+    
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=faq_kb())
+    except TelegramBadRequest:
+        pass
+    
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("faq_"))
+async def faq_show(callback: types.CallbackQuery):
+    """Показ ответа FAQ"""
+    faq_key = callback.data.split("_")[1]
+    
+    text = FAQ_TEXTS.get(faq_key, "❓ Информация не найдена")
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 К списку вопросов", callback_data="support_faq")
+    
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=builder.as_markup())
+    except TelegramBadRequest:
+        pass
+    
+    await callback.answer()
+
+
+# ============================================================
+# АДМИН: ОТВЕТЫ НА СООБЩЕНИЯ ПОДДЕРЖКИ
+# ============================================================
+
+@router.callback_query(F.data.startswith("admin_reply_"))
+async def admin_reply_start(callback: types.CallbackQuery, state: FSMContext):
+    """Админ начинает отвечать пользователю"""
+    parts = callback.data.split("_")
+    user_id = int(parts[2])
+    message_id = int(parts[3])
+    
+    # Сохраняем в состояние
+    await state.update_data(
+        reply_to_user_id=user_id,
+        reply_to_msg_id=message_id
+    )
+    await state.set_state(SupportState.admin_reply)
+    
+    # Запрашиваем ответ
+    await callback.message.answer(
+        f"✍️ <b>Введите ответ для пользователя</b>\n\n"
+        f"ID: <code>{user_id}</code>\n\n"
+        f"Для отмены напишите /cancel",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.message(SupportState.admin_reply)
+async def admin_reply_send(message: types.Message, state: FSMContext):
+    """Отправка ответа админа пользователю"""
+    data = await state.get_data()
+    user_id = data.get("reply_to_user_id")
+    
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("❌ Ответ отменён")
+        return
+    
+    if not user_id:
+        await state.clear()
+        await message.answer("❌ Ошибка: пользователь не найден")
+        return
+    
+    # Формируем сообщение для пользователя
+    user_text = (
+        f"💬 <b>Ответ поддержки</b>\n\n"
+        f"{message.text}\n\n"
+        f"───────────────\n"
+        f"Если у вас остались вопросы, напишите нам снова."
+    )
+    
+    try:
+        await message.bot.send_message(user_id, user_text, parse_mode="HTML")
+        
+        # Успех
+        await message.answer(
+            f"✅ <b>Ответ отправлен!</b>\n\n"
+            f"Получатель: <code>{user_id}</code>",
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        logger.error(f"Не удалось отправить ответ пользователю {user_id}: {e}")
+        await message.answer(
+            f"❌ <b>Не удалось отправить ответ</b>\n\n"
+            f"Возможно, пользователь заблокировал бота.\n"
+            f"Ошибка: {e}",
+            parse_mode="HTML"
+        )
+    
+    await state.clear()
+
+
+@router.callback_query(F.data.startswith("admin_ban_"))
+async def admin_ban_user(callback: types.CallbackQuery):
+    """Блокировка пользователя админом"""
+    user_id = int(callback.data.split("_")[2])
+    
+    async with async_session_maker() as session:
+        user = await session.scalar(
+            select(User).where(User.telegram_id == user_id)
+        )
+        
+        if not user:
+            await callback.answer("Пользователь не найден")
+            return
+        
+        user.is_banned = True
+        await session.commit()
+    
+    await callback.answer(f"⛔ Пользователь {user_id} заблокирован", show_alert=True)
+
+
+# --- Добавим кнопку "Поддержка" в профиль ---
+
+# Найдите функцию show_profile и добавьте кнопку в клавиатуру:
+# builder.button(text="🆘 Поддержка", callback_data="profile_support")

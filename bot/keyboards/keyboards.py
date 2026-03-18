@@ -5,7 +5,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 def main_menu_kb():
     kb = ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="📦 Каталог"), KeyboardButton(text="🛒 Корзина")],
-        [KeyboardButton(text="👤 Профиль")]
+        [KeyboardButton(text="🆘 Поддержка")], [KeyboardButton(text="👤 Профиль")]
     ], resize_keyboard=True)
     return kb
 
@@ -184,5 +184,51 @@ def admin_back_kb():
     """Кнопка назад в админ-меню"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 В админ-меню", callback_data="admin_back_menu")]
+    ])
+
+# --- ТЕХПОДДЕРЖКА ---
+
+def support_menu_kb():
+    """Меню поддержки для пользователя"""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✍️ Написать в поддержку", callback_data="support_new")
+    builder.button(text="❓ Частые вопросы (FAQ)", callback_data="support_faq")
+    builder.button(text="🔙 Назад", callback_data="back_to_profile")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_support_kb(user_id: int, message_id: int):
+    """Клавиатура для админа при получении сообщения"""
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="✉️ Ответить",
+        callback_data=f"admin_reply_{user_id}_{message_id}"
+    )
+    builder.button(
+        text="⛔ Заблокировать пользователя",
+        callback_data=f"admin_ban_{user_id}"
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def faq_kb():
+    """Клавиатура FAQ"""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🚚 Доставка", callback_data="faq_delivery")
+    builder.button(text="💳 Оплата", callback_data="faq_payment")
+    builder.button(text="🔄 Возврат и обмен", callback_data="faq_return")
+    builder.button(text="📏 Размеры", callback_data="faq_sizes")
+    builder.button(text="📞 Контакты", callback_data="faq_contacts")
+    builder.button(text="🔙 Назад", callback_data="support_back")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+def support_back_kb():
+    """Кнопка назад в поддержке"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 В меню поддержки", callback_data="support_back")]
     ])
 
